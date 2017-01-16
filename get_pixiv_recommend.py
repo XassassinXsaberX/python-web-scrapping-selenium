@@ -1,16 +1,17 @@
 from selenium import webdriver
 import requests
 import threading,re,os,time
+import shelve
 
 class Spider:
     def __init__(self,user_mail,password):
         self.__user_mail = user_mail
         self.__password = password
         self.__header = {'User-Agent' : 'Mozilla/5.0 (X11; Linux x86_64; rv:38.0) Gecko/20100101 Firefox/38.0'}
-        self.__web_page = []                                    #放置圖片的網頁(注意不是圖片的來源檔)  ex.  http://www.pixiv.net/member_illust.php?mode=medium&illust_id=60694672
-        self.__browser = 0      #存放一個瀏覽器物件(一開始先不放東西)
-        self.__cookies = {}     #存放登入的cookie資訊
-        self.__thread_num = 5   #要用多少thread來平行加速下載
+        self.__browser = 0          #存放一個瀏覽器物件(一開始先不放東西)
+        self.__cookies = {}         #存放登入的cookie資訊
+        self.__thread_num = 100 #要用多少thread來平行加速下載
+        self.__collect_point = 20000 #該圖片被收藏的次數
 
     def login(self):#登入到pixiv並取的cookie
         url = "https://accounts.pixiv.net/login?lang=zh&source=pc&view_type=page&ref=wwwtop_accounts_index"
@@ -53,7 +54,6 @@ class Spider:
             for i in range(len(web_lt)):
                 web_lt[i] = web_lt[i].split('<a href="')[1]
                 web_lt[i] = 'http://www.pixiv.net/' + web_lt[i][:-1]
-                self.__web_page.append(web_lt[i])
 
             thread = [0]*self.__thread_num  #建立self.__browser_num個thread來平行加速下載
             i=0
@@ -69,7 +69,59 @@ class Spider:
                 i+=1
             self.__browser.quit()
 
-    def download_image(self,url,i):
+
+    def search(self,word):
+        #從本地端開啟shelve檔，該檔存放的資料可告訴我們哪些圖片是已經下載過的(可將該檔案當成迷你資料庫)
+        database = shelve.open('data.shelve')
+
+        def thread_function(word,num,t,lock,database):#利用thread來平行加速搜尋，其中word代表要搜尋的關鍵字，num代表有多少thread，t代表第幾條thread
+        #lock代表互斥鎖，database代表shelve物件
+        #接下來利用無限回圈來搜尋要找的圖片
+            p = t
+            params = {'word': word, 'p': t, 'order': 'data_d'}
+            while True:
+                params['p'] = p
+                url = 'http://www.pixiv.net/search.php?'
+                r = requests.get(url,params=params,cookies=self.__cookies)
+                lt = re.findall(r'(<li class="image-item">[.\w\W\s\S]+?(<ul[.\w\W\s\S]+?</ul>){,1}</li>)',r.text)
+                if len(lt) == 0:#若該頁面以沒有圖片，代表已經沒以片可以搜尋了
+                    break
+                lt2 = [0]*len(lt)
+                for i in range(len(lt)):
+                    lt2[i] = lt[i][0]
+                lt = lt2
+
+                for i in range(len(lt)):
+                    if 'count-list' in lt[i]:#若該圖片有人收藏過
+                        lt2 = re.findall(r'<ul class="count-list">[.\w\W\s\W]+?</ul>',lt[i])
+                        n = re.findall(r'>[\d]+<',lt2[0])[0]
+                        n = int(n[1:-1])
+                        if n >= self.__collect_point:#如果該圖片的收藏數滿足搜尋條件
+                            url = re.findall(r'<a href="[^"]+?"',lt[i])[0]
+                            url = url.split('href="')[1]
+                            url = url[:-1]
+                            url = 'http://www.pixiv.net' + url  #這個url即為待會要丟到self.downlod_image()的url
+                            for j in range(len(url)-1,-1,-1):
+                                if url[j]=='=':
+                                    image_num = int(url[j+1:-1])
+                                    break
+                            #image_num為圖片編號，現在判斷該圖片編號是否存在於database中
+                            if str(image_num) not in database:
+                                with lock:
+                                    database[str(image_num)] = 1
+                                self.download_image(url)        #若database中沒有此圖片就下載吧
+                p += self.__thread_num   #p為頁數
+                if p > 1000:#最多只能找1000頁
+                    break
+
+        thread = [0]*self.__thread_num   #建立self.__thread_num個thread來平行下載
+        lock = threading.Lock()
+        for i in range(self.__thread_num):
+            thread[i] = threading.Thread(target=thread_function,args=(word,self.__thread_num,i,lock,database))
+            thread[i].start()
+
+
+    def download_image(self,url,i=0):
         try:
             #先建立一個資料夾來存放圖片
             if not os.path.isdir("pixiv_picture"):
@@ -139,8 +191,8 @@ class Spider:
                 for i in range(len(thread)):
                     threading.Thread(target=parallel_download,args=(image_url[i],dir_name,'http://www.pixiv.net/member_illust.php?mode=manga&illust_id='+image_num)).start()
 
-        except:
-            print("目前尚未能下載此類的圖片")
+        except BaseException as e:
+            print("目前尚未能下載此類的圖片，網址為:{0}".format(url),e)
 
 
 
@@ -151,7 +203,7 @@ if __name__=='__main__':
     password = 'ab123456789ba'
     spider = Spider(user_mail,password)
     spider.login()
-    spider.recommend()
-    #spider.download_image("http://www.pixiv.net/member_illust.php?mode=medium&amp;illust_id=60456774&amp;uarea=recommended_illusts_page",0)
-    #spider.download_image("http://www.pixiv.net/member_illust.php?mode=medium&illust_id=60799963",0)
-    
+    #spider.recommend()
+    #spider.download_image("http://www.pixiv.net/member_illust.php?mode=medium&amp;illust_id=60456774&amp;uarea=recommended_illusts_page",0)  #下載漫畫
+    #spider.download_image("http://www.pixiv.net/member_illust.php?mode=medium&illust_id=60799963",0)   #下載插畫
+    spider.search("レム")
